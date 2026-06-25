@@ -1029,7 +1029,7 @@ void setup() {
   setBacklight(true);
 
   SPI.begin(8, -1, 10, TFT_CS);   // SCK=8, MOSI=10
-  tft.init(240, 240);
+  tft.init(240, 240, SPI_MODE3);  // this panel needs SPI mode 3 (default mode 0 = black screen)
   tft.setSPISpeed(40000000);
   tft.setRotation(1);
   initColours();
