@@ -8,6 +8,9 @@ build/
 *.map
 *.hex
 
+# ...but DO keep the versioned firmware binaries archived under firmware/
+!firmware/**/*.bin
+
 # OS files
 .DS_Store
 Thumbs.db
