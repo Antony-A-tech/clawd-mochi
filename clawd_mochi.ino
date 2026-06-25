@@ -53,12 +53,37 @@ uint16_t C_ORANGE, C_DARKBG, C_MUTED, C_GREEN;
 #define C_BLACK ST77XX_BLACK
 
 // ── State ─────────────────────────────────────────────────────
-#define VIEW_EYES_NORMAL 0
-#define VIEW_EYES_SQUISH 1
-#define VIEW_CODE        2
-#define VIEW_DRAW        3
+#define VIEW_EYES 0          // showing eyes (which emotion = currentEmotion)
+#define VIEW_CODE 2
+#define VIEW_DRAW 3
 
-uint8_t  currentView  = VIEW_EYES_NORMAL;
+// ── Emotions (sub-state of VIEW_EYES) ─────────────────────────
+#define EMO_NORMAL     0
+#define EMO_SQUISH     1
+#define EMO_SLEEPY     2
+#define EMO_ANGRY      3
+#define EMO_SURPRISED  4
+#define EMO_SAD        5
+#define EMO_WINK       6
+#define EMO_LOVE       7
+#define EMO_DIZZY      8
+#define EMO_SUSPICIOUS 9
+#define EMO_COUNT      10
+
+#define CYCLE_INTERVAL_MS 15000   // auto-cycle: time per emotion
+
+// One frame of an emotion's looping timeline (declared early so the
+// Arduino auto-prototype for getTimeline() sees the type).
+struct EyeFrame { uint16_t dur; int16_t arg; };
+
+uint8_t  currentView    = VIEW_EYES;
+uint8_t  currentEmotion = EMO_NORMAL;
+bool     autoCycle      = false;
+bool     eyesStarted    = false;  // keep WiFi info screen until first interaction
+uint8_t  eyePhase       = 0;      // current frame index of the active emotion
+uint32_t eyeTimer       = 0;      // millis() of last frame advance
+uint32_t lastCycleMs    = 0;      // millis() of last auto-cycle switch
+
 bool     busy         = false;
 bool     backlightOn  = true;
 uint8_t  animSpeed    = 1;   // 1=slow(default) 2=normal 3=fast
@@ -412,25 +437,184 @@ void termAddChar(char c) {
 //  ANIMATIONS
 // ═════════════════════════════════════════════════════════════
 
-void animNormalEyes() {
-  busy = true;
-  const int16_t offs[] = {-16, 16, -16, 16, 0};
-  for (uint8_t i = 0; i < 5; i++) { drawNormalEyes(offs[i]); delay(speedMs(80)); }
-  drawNormalEyes(0, true);  delay(speedMs(100));
-  drawNormalEyes(0, false); delay(speedMs(70));
-  drawNormalEyes(0, true);  delay(speedMs(70));
-  drawNormalEyes(0, false);
-  busy = false;
+// ═════════════════════════════════════════════════════════════
+//  EMOTION ENGINE (non-blocking, millis-based)
+// ═════════════════════════════════════════════════════════════
+//  Each emotion is a looping timeline of frames {duration, arg}.
+//  The engine in updateEyes() advances one frame at a time and
+//  redraws ONLY on a frame change → no flicker while resting.
+//  "arg" meaning depends on the emotion (offset / pose / 100=blink).
+//  (struct EyeFrame is declared near the top, in the State section.)
+
+static const EyeFrame TL_NORMAL[]     = {{3000,0},{160,-16},{160,0},{160,16},{160,0},{2500,0},{90,100},{90,0},{90,100},{90,0}};
+static const EyeFrame TL_SQUISH[]     = {{1300,0},{500,1}};
+static const EyeFrame TL_SLEEPY[]     = {{3500,0},{450,1}};
+static const EyeFrame TL_ANGRY[]      = {{2600,0},{70,-2},{70,2},{70,-2},{70,2},{70,0},{2000,0},{110,100},{110,0}};
+static const EyeFrame TL_SURPRISED[]  = {{3000,0},{250,1},{200,0}};
+static const EyeFrame TL_SAD[]        = {{3500,0},{400,1}};
+static const EyeFrame TL_WINK[]       = {{2400,0},{260,1}};
+static const EyeFrame TL_LOVE[]       = {{520,0},{460,1}};
+static const EyeFrame TL_DIZZY[]      = {{130,0},{130,1},{130,2},{130,3}};
+static const EyeFrame TL_SUSPICIOUS[] = {{900,0},{650,10},{900,0},{650,-10}};
+
+static void getTimeline(uint8_t emo, const EyeFrame** fr, uint8_t* n) {
+  switch (emo) {
+    case EMO_SQUISH:     *fr = TL_SQUISH;     *n = sizeof(TL_SQUISH)/sizeof(EyeFrame);     break;
+    case EMO_SLEEPY:     *fr = TL_SLEEPY;     *n = sizeof(TL_SLEEPY)/sizeof(EyeFrame);     break;
+    case EMO_ANGRY:      *fr = TL_ANGRY;      *n = sizeof(TL_ANGRY)/sizeof(EyeFrame);      break;
+    case EMO_SURPRISED:  *fr = TL_SURPRISED;  *n = sizeof(TL_SURPRISED)/sizeof(EyeFrame);  break;
+    case EMO_SAD:        *fr = TL_SAD;        *n = sizeof(TL_SAD)/sizeof(EyeFrame);        break;
+    case EMO_WINK:       *fr = TL_WINK;       *n = sizeof(TL_WINK)/sizeof(EyeFrame);       break;
+    case EMO_LOVE:       *fr = TL_LOVE;       *n = sizeof(TL_LOVE)/sizeof(EyeFrame);       break;
+    case EMO_DIZZY:      *fr = TL_DIZZY;      *n = sizeof(TL_DIZZY)/sizeof(EyeFrame);      break;
+    case EMO_SUSPICIOUS: *fr = TL_SUSPICIOUS; *n = sizeof(TL_SUSPICIOUS)/sizeof(EyeFrame); break;
+    default:             *fr = TL_NORMAL;     *n = sizeof(TL_NORMAL)/sizeof(EyeFrame);     break;
+  }
 }
 
-void animSquishEyes() {
-  busy = true;
-  for (uint8_t i = 0; i < 3; i++) {
-    drawSquishEyes(false); delay(speedMs(160));
-    drawSquishEyes(true);  delay(speedMs(100));
+// ── New emotion renderers (all eyes are BLACK on animBgColor) ──
+void drawSleepy(bool closed) {
+  tft.fillScreen(animBgColor);
+  const int16_t lx = eyeLX(0), rx = eyeRX(0), ey = eyeY();
+  const int16_t h  = closed ? 6 : 26;
+  const int16_t yy = ey + EYE_H - h;                 // sit low (drooping)
+  tft.fillRect(lx, yy, EYE_W, h, C_BLACK);
+  tft.fillRect(rx, yy, EYE_W, h, C_BLACK);
+}
+
+void drawAngry(int16_t shake, bool blink) {
+  tft.fillScreen(animBgColor);
+  const int16_t lx = eyeLX(shake), rx = eyeRX(shake), ey = eyeY();
+  if (blink) {
+    tft.fillRect(lx, ey + EYE_H/2 - 3, EYE_W, 6, C_BLACK);
+    tft.fillRect(rx, ey + EYE_H/2 - 3, EYE_W, 6, C_BLACK);
+    return;
   }
-  drawSquishEyes(false);
-  busy = false;
+  tft.fillRect(lx, ey, EYE_W, EYE_H, C_BLACK);
+  tft.fillRect(rx, ey, EYE_W, EYE_H, C_BLACK);
+  const int16_t cut = 26;                            // cut top-INNER corners
+  tft.fillTriangle(lx + EYE_W, ey, lx + EYE_W, ey + cut, lx + EYE_W - cut, ey, animBgColor);
+  tft.fillTriangle(rx, ey, rx, ey + cut, rx + cut, ey, animBgColor);
+}
+
+void drawSurprised(bool wide) {
+  tft.fillScreen(animBgColor);
+  const int16_t extra = wide ? 6 : 0;
+  const int16_t w = 34 + extra, h = 60 + extra * 2;
+  const int16_t cxL = eyeLX(0) + EYE_W/2, cxR = eyeRX(0) + EYE_W/2, cy = eyeCY();
+  tft.fillRoundRect(cxL - w/2, cy - h/2, w, h, w/2, C_BLACK);
+  tft.fillRoundRect(cxR - w/2, cy - h/2, w, h, w/2, C_BLACK);
+}
+
+void drawSad(bool blink) {
+  tft.fillScreen(animBgColor);
+  const int16_t lx = eyeLX(0), rx = eyeRX(0), ey = eyeY() + 8;  // lower = looking down
+  if (blink) {
+    tft.fillRect(lx, ey + EYE_H/2 - 3, EYE_W, 6, C_BLACK);
+    tft.fillRect(rx, ey + EYE_H/2 - 3, EYE_W, 6, C_BLACK);
+    return;
+  }
+  tft.fillRect(lx, ey, EYE_W, EYE_H, C_BLACK);
+  tft.fillRect(rx, ey, EYE_W, EYE_H, C_BLACK);
+  const int16_t cut = 26;                            // cut top-OUTER corners
+  tft.fillTriangle(lx, ey, lx, ey + cut, lx + cut, ey, animBgColor);
+  tft.fillTriangle(rx + EYE_W, ey, rx + EYE_W, ey + cut, rx + EYE_W - cut, ey, animBgColor);
+}
+
+void drawWink(bool winking) {
+  tft.fillScreen(animBgColor);
+  const int16_t lx = eyeLX(0), rx = eyeRX(0), ey = eyeY();
+  tft.fillRect(lx, ey, EYE_W, EYE_H, C_BLACK);       // left always open
+  if (winking) tft.fillRect(rx, ey + EYE_H/2 - 3, EYE_W, 6, C_BLACK);
+  else         tft.fillRect(rx, ey, EYE_W, EYE_H, C_BLACK);
+}
+
+void drawHeartShape(int16_t cx, int16_t cy, int16_t s) {
+  tft.fillCircle(cx - s/2, cy - s/3, s/2, C_BLACK);
+  tft.fillCircle(cx + s/2, cy - s/3, s/2, C_BLACK);
+  tft.fillTriangle(cx - s, cy - s/3, cx + s, cy - s/3, cx, cy + s, C_BLACK);
+}
+
+void drawLove(bool big) {
+  tft.fillScreen(animBgColor);
+  const int16_t s = big ? 22 : 18;
+  drawHeartShape(eyeLX(0) + EYE_W/2, eyeCY(), s);
+  drawHeartShape(eyeRX(0) + EYE_W/2, eyeCY(), s);
+}
+
+void drawXEye(int16_t cx, int16_t cy) {
+  const int16_t r = 16;
+  for (int8_t t = -2; t <= 2; t++) {
+    tft.drawLine(cx - r, cy - r + t, cx + r, cy + r + t, C_BLACK);
+    tft.drawLine(cx - r, cy + r + t, cx + r, cy - r + t, C_BLACK);
+  }
+}
+
+void drawDizzy(uint8_t j) {
+  tft.fillScreen(animBgColor);
+  static const int8_t off[4][2] = {{0,0},{2,-1},{0,2},{-2,0}};
+  const int16_t dx = off[j & 3][0], dy = off[j & 3][1];
+  drawXEye(eyeLX(0) + EYE_W/2 + dx, eyeCY() + dy);
+  drawXEye(eyeRX(0) + EYE_W/2 + dx, eyeCY() + dy);
+}
+
+void drawSuspicious(int16_t ox) {
+  tft.fillScreen(animBgColor);
+  const int16_t lx = eyeLX(ox), rx = eyeRX(ox), cy = eyeCY();
+  const int16_t h = 16, yy = cy - h/2;               // narrowed slits, darting
+  tft.fillRect(lx, yy, EYE_W, h, C_BLACK);
+  tft.fillRect(rx, yy, EYE_W, h, C_BLACK);
+}
+
+// Draw the active emotion at the current eyePhase
+void renderEye() {
+  const EyeFrame* fr; uint8_t n;
+  getTimeline(currentEmotion, &fr, &n);
+  const int16_t arg = fr[eyePhase % n].arg;
+  switch (currentEmotion) {
+    case EMO_SQUISH:     drawSquishEyes(arg == 1);                     break;
+    case EMO_SLEEPY:     drawSleepy(arg == 1);                         break;
+    case EMO_ANGRY:      drawAngry(arg == 100 ? 0 : arg, arg == 100);  break;
+    case EMO_SURPRISED:  drawSurprised(arg == 1);                      break;
+    case EMO_SAD:        drawSad(arg == 1);                            break;
+    case EMO_WINK:       drawWink(arg == 1);                           break;
+    case EMO_LOVE:       drawLove(arg == 1);                           break;
+    case EMO_DIZZY:      drawDizzy((uint8_t)arg);                      break;
+    case EMO_SUSPICIOUS: drawSuspicious(arg);                          break;
+    default:             drawNormalEyes(arg == 100 ? 0 : arg, arg == 100); break;
+  }
+}
+
+// Switch to an emotion and draw its first frame immediately
+void setEmotion(uint8_t e) {
+  currentEmotion = e % EMO_COUNT;
+  currentView    = VIEW_EYES;
+  eyesStarted    = true;
+  eyePhase       = 0;
+  eyeTimer       = millis();
+  lastCycleMs    = millis();
+  busy           = false;
+  renderEye();
+}
+
+// Called every loop(): advances frames + handles auto-cycle, non-blocking
+void updateEyes() {
+  if (!eyesStarted || currentView != VIEW_EYES) return;
+  const uint32_t now = millis();
+
+  if (autoCycle && now - lastCycleMs >= CYCLE_INTERVAL_MS) {
+    setEmotion((currentEmotion + 1) % EMO_COUNT);    // setEmotion resets lastCycleMs
+    return;
+  }
+
+  const EyeFrame* fr; uint8_t n;
+  getTimeline(currentEmotion, &fr, &n);
+  const uint16_t dur = speedMs(fr[eyePhase % n].dur);
+  if (now - eyeTimer >= dur) {
+    eyeTimer = now;
+    eyePhase = (eyePhase + 1) % n;
+    renderEye();
+  }
 }
 
 void animLogoReveal() {
@@ -493,6 +677,18 @@ body{background:#1c1c20;font-family:'Courier New',monospace;color:#e8e4dc;
 .cbtn.dim{border-color:#2e2a28;color:#4a4540}
 
 /* View grid */
+/* Emotion grid */
+.egrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;width:100%;max-width:390px}
+.ebtn{background:#252428;border:1.5px solid #38343a;border-radius:10px;
+  color:#d8d4cc;font-family:'Courier New',monospace;
+  padding:10px 6px;cursor:pointer;text-align:center;transition:all .12s;
+  user-select:none;display:flex;align-items:center;justify-content:center;gap:8px}
+.ebtn:active:not(:disabled){transform:scale(.94)}
+.ebtn:disabled{opacity:.3;cursor:default}
+.ebtn .ee{font-size:20px;line-height:1}
+.ebtn .en{font-size:12px;font-weight:bold;color:#e8e4dc}
+.ebtn.active{border-color:#c96a3e;background:#201408}
+
 .vgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;width:100%;max-width:390px}
 .vbtn{background:#252428;border:1.5px solid #38343a;border-radius:12px;
   color:#d8d4cc;font-family:'Courier New',monospace;
@@ -572,19 +768,27 @@ canvas{width:100%;border-radius:8px;border:1.5px solid #38343a;
   <button class="cbtn on" id="blBtn" onclick="toggleBL()">&#9728; display on</button>
 </div>
 
+<div class="sec">// emotions</div>
+<div class="egrid">
+  <button class="ebtn active" data-e="0" onclick="setEmotion(0)"><span class="ee">&#128528;</span><span class="en">Normal</span></button>
+  <button class="ebtn" data-e="1" onclick="setEmotion(1)"><span class="ee">&#128522;</span><span class="en">Squish</span></button>
+  <button class="ebtn" data-e="2" onclick="setEmotion(2)"><span class="ee">&#128564;</span><span class="en">Sleepy</span></button>
+  <button class="ebtn" data-e="3" onclick="setEmotion(3)"><span class="ee">&#128544;</span><span class="en">Angry</span></button>
+  <button class="ebtn" data-e="4" onclick="setEmotion(4)"><span class="ee">&#128562;</span><span class="en">Surprised</span></button>
+  <button class="ebtn" data-e="5" onclick="setEmotion(5)"><span class="ee">&#128546;</span><span class="en">Sad</span></button>
+  <button class="ebtn" data-e="6" onclick="setEmotion(6)"><span class="ee">&#128521;</span><span class="en">Wink</span></button>
+  <button class="ebtn" data-e="7" onclick="setEmotion(7)"><span class="ee">&#10084;&#65039;</span><span class="en">Love</span></button>
+  <button class="ebtn" data-e="8" onclick="setEmotion(8)"><span class="ee">&#128565;</span><span class="en">Dizzy</span></button>
+  <button class="ebtn" data-e="9" onclick="setEmotion(9)"><span class="ee">&#129320;</span><span class="en">Suspicious</span></button>
+</div>
+
+<div class="ctrl">
+  <button class="cbtn" id="autoBtn" onclick="toggleAuto()">&#128260; auto-cycle off</button>
+</div>
+
 <div class="sec">// views</div>
 <div class="vgrid">
-  <button class="vbtn active" data-v="0" onclick="setView(0)">
-    <span class="ic">&#9632; &#9632;</span>
-    <span class="nm">Normal eyes</span>
-    <span class="ht">wiggle + blink</span>
-  </button>
-  <button class="vbtn" data-v="1" onclick="setView(1)">
-    <span class="ic">&gt; &lt;</span>
-    <span class="nm">Squish eyes</span>
-    <span class="ht">open / close</span>
-  </button>
-  <button class="vbtn" data-v="2" onclick="setView(2)">
+  <button class="vbtn" data-v="2" onclick="openCode()">
     <span class="ic">{ }</span>
     <span class="nm">Claude Code</span>
     <span class="ht">opens terminal</span>
@@ -638,7 +842,8 @@ canvas{width:100%;border-radius:8px;border:1.5px solid #38343a;
 <div class="toast" id="toast"></div>
 
 <script>
-let activeView  = 0;
+let activeEmotion = 0;
+let autoOn      = false;
 let termOpen    = false;
 let canvasOpen  = false;
 let blOn        = true;
@@ -663,14 +868,12 @@ function toast(msg, ok=true) {
 function setBusy(b) {
   isBusy = b;
   document.getElementById('busy').classList.toggle('show', b);
-  const locked = b || termOpen;
+  const locked = b || termOpen || canvasOpen;
+  document.querySelectorAll('.ebtn').forEach(el => el.disabled = locked);
+  document.getElementById('autoBtn').disabled = locked;
   document.querySelectorAll('.vbtn').forEach(el => {
-    // when canvas open, keep canvas btn (data-v=3) active so user can exit
-    el.disabled = canvasOpen ? parseInt(el.dataset.v) !== 3 : locked;
-  });
-  document.querySelectorAll('.lbtn').forEach(el => el.disabled = locked || canvasOpen);
-  document.querySelectorAll('.cbtn').forEach(el => {
-    if (el.id !== 'blBtn') el.disabled = locked;
+    // keep canvas btn (data-v=3) usable while canvas open so user can exit
+    el.disabled = canvasOpen ? parseInt(el.dataset.v) !== 3 : (b || termOpen);
   });
 }
 
@@ -678,17 +881,6 @@ function setBusy(b) {
 async function req(path) {
   try { const r = await fetch(path); return r.ok; }
   catch(e) { toast('no connection', false); return false; }
-}
-
-async function waitNotBusy() {
-  for (let i = 0; i < 100; i++) {
-    try {
-      const r = await fetch('/state');
-      const j = await r.json();
-      if (!j.busy) return;
-    } catch(e) {}
-    await new Promise(r => setTimeout(r, 150));
-  }
 }
 
 // ── Background colour ───────────────────────────────────────────
@@ -707,29 +899,40 @@ async function setSpeed(v) {
   await req('/speed?v=' + v);
 }
 
-// ── Views ───────────────────────────────────────────────────────
-async function setView(v) {
-  if (isBusy || termOpen || canvasOpen) return;
-  if (v === 3) { toggleCanvas(); return; }  // canvas button in grid
-  const keys = ['w','s','d'];
-  if (!await req('/cmd?k=' + keys[v])) return;
-  activeView = v;
-  document.querySelectorAll('.vbtn').forEach(b =>
-    b.classList.toggle('active', parseInt(b.dataset.v) === v));
-  if (v === 2) {
-    termOpen = true;
-    document.getElementById('twrap').classList.add('open');
-    setBusy(false);   // re-run to apply termOpen lock
-    setBusy(false);
-    document.querySelectorAll('.vbtn,.lbtn').forEach(b => b.disabled = true);
-    const cvb = document.getElementById('cvBtn'); if (cvb) cvb.disabled = true;
-    document.getElementById('tin').focus();
-    toast('terminal open');
-    return;
-  }
-  setBusy(true);
-  await waitNotBusy();
-  setBusy(false);
+// ── Emotions ────────────────────────────────────────────────────
+function updateEmotionUI() {
+  document.querySelectorAll('.ebtn').forEach(b =>
+    b.classList.toggle('active', !autoOn && parseInt(b.dataset.e) === activeEmotion));
+  const ab = document.getElementById('autoBtn');
+  ab.classList.toggle('on', autoOn);
+  ab.textContent = autoOn ? '\u{1F504} auto-cycle on' : '\u{1F504} auto-cycle off';
+}
+
+async function setEmotion(e) {
+  if (termOpen || canvasOpen) return;
+  if (!await req('/emotion?e=' + e)) return;
+  activeEmotion = e; autoOn = false;
+  updateEmotionUI();
+}
+
+async function toggleAuto() {
+  if (termOpen || canvasOpen) return;
+  autoOn = !autoOn;
+  await req('/autocycle?on=' + (autoOn ? 1 : 0));
+  updateEmotionUI();
+  toast(autoOn ? 'auto-cycle on' : 'auto-cycle off');
+}
+
+// ── Claude Code view (opens terminal) ───────────────────────────
+async function openCode() {
+  if (termOpen || canvasOpen) return;
+  if (!await req('/cmd?k=d')) return;
+  termOpen = true;
+  document.getElementById('twrap').classList.add('open');
+  document.querySelectorAll('.ebtn,.vbtn').forEach(b => b.disabled = true);
+  document.getElementById('autoBtn').disabled = true;
+  document.getElementById('tin').focus();
+  toast('terminal open');
 }
 
 // ── Logo animations (kept for startup, not exposed in UI) ──────
@@ -758,8 +961,12 @@ async function toggleCanvas() {
     const bg = document.getElementById('bgCol').value;
     redrawCanvas(bg);
     await req('/draw/clear?bg=' + encodeURIComponent(bg));
-    // lock all other buttons
-    document.querySelectorAll('.vbtn,.lbtn').forEach(b => b.disabled = true);
+    // lock all other buttons (keep canvas vbtn usable to exit)
+    document.querySelectorAll('.ebtn').forEach(b => b.disabled = true);
+    document.getElementById('autoBtn').disabled = true;
+    document.querySelectorAll('.vbtn').forEach(b => {
+      if (parseInt(b.dataset.v) !== 3) b.disabled = true;
+    });
     toast('canvas active');
   } else {
     setBusy(false);   // re-evaluate locks
@@ -864,6 +1071,10 @@ async function clearAll() {
     const spd = j.speed || 1;
     document.getElementById('spd').value = spd;
     document.getElementById('spdV').textContent = spdLabels[spd];
+    // Sync emotion + auto-cycle
+    activeEmotion = j.emotion || 0;
+    autoOn = (j.auto === true);
+    updateEmotionUI();
     // Sync backlight
     if (j.bl === false) {
       blOn = false;
@@ -904,16 +1115,36 @@ void routeCmd() {
 
   server.send(200, "application/json", "{\"ok\":1}");
   switch (c) {
-    case 'w': currentView = VIEW_EYES_NORMAL; animNormalEyes(); break;
-    case 's': currentView = VIEW_EYES_SQUISH; animSquishEyes(); break;
     case 'd':
       currentView = VIEW_CODE; drawCodeView();
       termMode = true; termClear(); termFullRedraw(); break;
     case 'a':
-      currentView = VIEW_EYES_NORMAL;
       animLogoReveal();
+      setEmotion(currentEmotion);   // back to live eyes after the reveal
       break;
   }
+}
+
+// /emotion?e=0..9 — pick an emotion (manual pick turns auto-cycle OFF)
+void routeEmotion() {
+  if (server.hasArg("e")) {
+    const int e = constrain(server.arg("e").toInt(), 0, EMO_COUNT - 1);
+    autoCycle = false;
+    setEmotion(e);
+  }
+  server.send(200, "application/json", "{\"ok\":1}");
+}
+
+// /autocycle?on=0|1 — toggle automatic emotion rotation
+void routeAutocycle() {
+  autoCycle = server.hasArg("on") && server.arg("on") == "1";
+  if (autoCycle) {
+    eyesStarted = true;
+    currentView = VIEW_EYES;
+    lastCycleMs = millis();
+    renderEye();
+  }
+  server.send(200, "application/json", "{\"ok\":1}");
 }
 
 void routeChar() {
@@ -935,10 +1166,9 @@ void routeRedraw() {
     drawBgColor = animBgColor;
   }
   switch (currentView) {
-    case VIEW_EYES_NORMAL: drawNormalEyes(); break;
-    case VIEW_EYES_SQUISH: drawSquishEyes(); break;
-    case VIEW_CODE:        drawCodeView();   break;
-    case VIEW_DRAW:        tft.fillScreen(drawBgColor); break;
+    case VIEW_EYES: renderEye();     break;
+    case VIEW_CODE: drawCodeView();  break;
+    case VIEW_DRAW: tft.fillScreen(drawBgColor); break;
   }
   server.send(200, "application/json", "{\"ok\":1}");
 }
@@ -1008,6 +1238,8 @@ String rgb565ToHex(uint16_t c) {
 
 void routeState() {
   String j = "{\"view\":"; j += currentView;
+  j += ",\"emotion\":"; j += currentEmotion;
+  j += ",\"auto\":";    j += autoCycle   ? "true" : "false";
   j += ",\"busy\":";   j += busy        ? "true" : "false";
   j += ",\"term\":";   j += termMode    ? "true" : "false";
   j += ",\"bl\":";     j += backlightOn ? "true" : "false";
@@ -1065,6 +1297,8 @@ void setup() {
   // ── Register routes ────────────────────────────────────────
   server.on("/",            HTTP_GET, routeRoot);
   server.on("/cmd",         HTTP_GET, routeCmd);
+  server.on("/emotion",     HTTP_GET, routeEmotion);
+  server.on("/autocycle",   HTTP_GET, routeAutocycle);
   server.on("/char",        HTTP_GET, routeChar);
   server.on("/speed",       HTTP_GET, routeSpeed);
   server.on("/redraw",      HTTP_GET, routeRedraw);
@@ -1076,12 +1310,15 @@ void setup() {
   server.onNotFound(routeNotFound);
   server.begin();
 
-  // WiFi info stays on screen — first button press triggers setView/cmd
-  // which will replace it with the correct view
+  // WiFi info stays on screen until the first interaction (eyesStarted=false);
+  // picking an emotion or enabling auto-cycle starts the live eyes.
 }
 
 // ═════════════════════════════════════════════════════════════
 //  LOOP
 // ═════════════════════════════════════════════════════════════
 
-void loop() { server.handleClient(); }
+void loop() {
+  server.handleClient();
+  updateEyes();
+}
