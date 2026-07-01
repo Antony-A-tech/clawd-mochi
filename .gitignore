@@ -10,6 +10,8 @@ build/
 
 # ...but DO keep the versioned firmware binaries archived under firmware/
 !firmware/**/*.bin
+# ...except arduino-cli's *_flashed.bin upload byproducts
+firmware/**/*_flashed.bin
 
 # OS files
 .DS_Store
