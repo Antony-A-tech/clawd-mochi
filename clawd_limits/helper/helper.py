@@ -10,7 +10,10 @@ The helper never touches any credentials.
 
 Runs as a tray app (pixel-crab icon) by default; falls back to the console.
 
-Run:  pythonw helper.py [COMPORT]     (tray, no console window)
+The COM port is auto-detected (finds the crab by its USB id, any COM); pass a
+port only to override.
+
+Run:  pythonw helper.py              (tray, auto-detect port, no console window)
       python  helper.py [COMPORT] --console
 Stop: tray menu -> Quit   (or Ctrl+C in console mode)
 """
@@ -29,7 +32,7 @@ CONSOLE = "--console" in _args
 _pos = [a for a in _args if not a.startswith("--")]
 
 HTTP_PORT   = 7654
-COM         = _pos[0] if _pos else "COM6"
+COM         = _pos[0] if _pos else None   # explicit port, or None -> auto-detect
 BAUD        = 115200
 RESEND_SECS = 30
 
@@ -37,23 +40,48 @@ ser = None
 last_value = None
 last_update = None
 connected = False
+cur_port = None
+_fail_logged = False
 lock = threading.Lock()
+
+# ── find the crab on any COM port by its USB id ────────────────────
+def find_crab_ports():
+    """Candidate ports, most-likely first: Espressif native USB, then UART bridges."""
+    try:
+        from serial.tools import list_ports
+    except Exception:
+        return []
+    ports = list(list_ports.comports())
+    esp = [p.device for p in ports if p.vid == 0x303A]        # ESP32-C3/S3 native USB
+    bridges = {(0x10C4, 0xEA60), (0x1A86, 0x7523),            # CP2102, CH340
+               (0x1A86, 0x55D4), (0x0403, 0x6001)}            # CH9102, FT232
+    uart = [p.device for p in ports if (p.vid, p.pid) in bridges]
+    return esp + uart
+
+def resolve_ports():
+    return [COM] if COM else find_crab_ports()
 
 # ── serial ────────────────────────────────────────────────────────
 def open_serial():
-    """Open the port WITHOUT toggling DTR/RTS, so we don't reset the crab."""
-    global ser, connected
-    try:
-        s = serial.Serial()
-        s.port = COM; s.baudrate = BAUD; s.timeout = 1
-        s.dtr = False; s.rts = False
-        s.open()
-        ser = s; connected = True
-        time.sleep(0.5)
-        print(f"[serial] open {COM} (no-reset)")
-    except Exception as e:
-        ser = None; connected = False
-        print(f"[serial] open failed: {e}")
+    """Find the crab and open it WITHOUT toggling DTR/RTS (so we don't reset it).
+    Tries each candidate port and keeps the first that opens (skips dead ports)."""
+    global ser, connected, cur_port, _fail_logged
+    for port in resolve_ports():
+        try:
+            s = serial.Serial()
+            s.port = port; s.baudrate = BAUD; s.timeout = 1
+            s.dtr = False; s.rts = False
+            s.open()
+            ser = s; connected = True; cur_port = port; _fail_logged = False
+            time.sleep(0.5)
+            print(f"[serial] open {port} (no-reset)")
+            return
+        except Exception:
+            continue
+    ser = None; connected = False; cur_port = None
+    if not _fail_logged:
+        print("[serial] no crab found (auto-detect) — waiting for it to be plugged in")
+        _fail_logged = True
 
 def write_crab(line):
     global ser, connected
@@ -118,7 +146,7 @@ class Handler(BaseHTTPRequestHandler):
 def start_http():
     srv = HTTPServer(("127.0.0.1", HTTP_PORT), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f"[http] http://127.0.0.1:{HTTP_PORT}  crab={COM}  re-send={RESEND_SECS}s", flush=True)
+    print(f"[http] http://127.0.0.1:{HTTP_PORT}  crab={cur_port or 'auto'}  re-send={RESEND_SECS}s", flush=True)
     return srv
 
 # ── tray ──────────────────────────────────────────────────────────
@@ -154,7 +182,7 @@ def run_tray():
     srv = start_http()
 
     menu = pystray.Menu(
-        pystray.MenuItem(lambda i: f"{'● connected' if connected else '○ no crab'} · {COM}", None, enabled=False),
+        pystray.MenuItem(lambda i: ("● " + cur_port if connected else "○ searching for crab…"), None, enabled=False),
         pystray.MenuItem(lambda i: f"Last: {last_value or '—'}", None, enabled=False),
         pystray.MenuItem(lambda i: f"Updated: {_ago()}", None, enabled=False),
         pystray.Menu.SEPARATOR,
@@ -166,9 +194,12 @@ def run_tray():
     def updater():
         was = None
         while True:
+            if not connected:
+                with lock:
+                    if ser is None: open_serial()      # keep hunting for the crab on any COM
             if connected != was:
                 icon.icon = crab_icon(connected); was = connected
-            icon.title = f"Clawd Mochi · {'connected' if connected else 'no crab'} · {COM} · {last_value or '—'}"
+            icon.title = (f"Clawd Mochi · {cur_port} · {last_value or '—'}") if connected else "Clawd Mochi · searching for crab…"
             try: icon.update_menu()
             except Exception: pass
             time.sleep(3)
@@ -183,7 +214,7 @@ def run_console():
     open_serial()
     threading.Thread(target=resender, daemon=True).start()
     srv = HTTPServer(("127.0.0.1", HTTP_PORT), Handler)
-    print(f"[http] http://127.0.0.1:{HTTP_PORT}  crab={COM}  re-send={RESEND_SECS}s  (console)", flush=True)
+    print(f"[http] http://127.0.0.1:{HTTP_PORT}  crab={cur_port or 'auto'}  re-send={RESEND_SECS}s  (console)", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
