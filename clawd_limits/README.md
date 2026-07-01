@@ -47,5 +47,6 @@ Or flash the prebuilt binaries from [`../firmware/limits-v1.0.0/`](../firmware) 
 1. Flash this firmware to the crab and plug it into the PC over USB.
 2. Install the **claude-limits** browser extension and sign in to claude.ai.
 3. Run the helper: double-click `helper/start-helper.vbs` (tray app), or
-   `pythonw helper/helper.py COM6`. It bridges the extension to the crab and
-   re-sends the last value every 30 s.
+   `pythonw helper/helper.py`. It **auto-detects** the crab's COM port (by USB
+   id, any COM), bridges the extension to the crab, and re-sends the last value
+   every 30 s. Pass a port only to override, e.g. `helper.py COM6`.
