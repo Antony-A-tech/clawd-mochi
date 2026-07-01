@@ -13,9 +13,10 @@ build without recompiling, so you can switch between versions at any time.
 | ------- | ---------- | ------------ |
 | `v1.0.0-base` | `v1.0.0` | Original upstream firmware + **ST7789 SPI mode 3** display fix (this panel shows a black screen on the default mode 0). Two eye views (Normal, Squish), animate once on selection. |
 | `v1.1.0-emotions` | `v1.1.0` | **10 live looping eye emotions** (Normal, Squish, Sleepy, Angry, Surprised, Sad, Wink, Love, Dizzy, Suspicious), non-blocking animation engine, and a **15 s auto-cycle** mode. Web controller gets an emotion grid + auto-cycle toggle. |
+| `limits-v1.0.0` | `limits-v1.0.0` | **Claude usage-limits display** (a different firmware, not the eyes): shows session (5h) + weekly % with a coloured bar and reset countdown, fed over USB by the [claude-limits](https://github.com/Antony-A-tech/claude-limits) browser extension + a small local helper. After ~90 s with no data it dims and cycles the v1.0.0 eyes. Source: [`../clawd_limits/`](../clawd_limits). |
 
-Each folder contains: `clawd_mochi.ino.bin` (app), `clawd_mochi.ino.bootloader.bin`,
-`clawd_mochi.ino.partitions.bin`, `boot_app0.bin`.
+Each folder contains the four flashable images. The eye firmwares use
+`clawd_mochi.ino.*`; the limits firmware uses `clawd_limits.ino.*` (plus the shared `boot_app0.bin`).
 
 ## How to flash a version
 
