@@ -1,7 +1,7 @@
 ' Clawd Mochi helper — double-click to start the tray app (no console window).
-' Not autostart: just a convenient silent launcher.
-' The crab's COM port is auto-detected (no need to edit anything).
-Set sh = CreateObject("WScript.Shell")
-pyw = "C:\Users\a.nozhenko\AppData\Local\Programs\Python\Python310\pythonw.exe"
-script = "d:\Home\ClawdMochi\pc-helper\helper.py"
-sh.Run """" & pyw & """ """ & script & """", 0, False
+' Portable: runs pythonw (from PATH) on helper.py next to this file. Not autostart.
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set sh  = CreateObject("WScript.Shell")
+here = fso.GetParentFolderName(WScript.ScriptFullName)
+sh.CurrentDirectory = here
+sh.Run "pythonw """ & here & "\helper.py""", 0, False

@@ -50,3 +50,23 @@ Or flash the prebuilt binaries from [`../firmware/limits-v1.0.0/`](../firmware) 
    `pythonw helper/helper.py`. It **auto-detects** the crab's COM port (by USB
    id, any COM), bridges the extension to the crab, and re-sends the last value
    every 30 s. Pass a port only to override, e.g. `helper.py COM6`.
+
+## Set up the helper on another PC
+
+The helper is pure Python + a tray icon, so every PC the crab plugs into needs it.
+Requires **Python 3** (tick *Add python to PATH* during install).
+
+```sh
+git clone https://github.com/Antony-A-tech/clawd-mochi.git
+cd clawd-mochi/clawd_limits/helper
+pip install -r requirements.txt        # pyserial, pystray, pillow
+```
+
+Then start it (auto-detects the crab's COM port — nothing to edit):
+
+- **Windows:** double-click `start-helper.vbs` (tray icon, no console window)
+- **console / debug:** `python helper.py --console`
+
+Install the **claude-limits** browser extension in that browser and sign in to
+claude.ai — the crab then shows your limits. The launcher is portable: it finds
+`pythonw` on PATH and `helper.py` next to itself, so the clone can live anywhere.
