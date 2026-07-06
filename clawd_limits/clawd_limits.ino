@@ -13,6 +13,7 @@
 #include <Fonts/FreeMonoBold12pt7b.h>
 #include <Fonts/FreeMonoBold24pt7b.h>
 #include "logo_boot.h"
+#include "esp_task_wdt.h"
 
 #define TFT_CS  4
 #define TFT_DC  1
@@ -179,14 +180,13 @@ void parseLine(String line) {
   if (line.length() == 0) return;
   int c1 = line.indexOf(',');
   int c2 = line.indexOf(',', c1 + 1);
-  if (c1 <= 0 || c2 <= c1) { Serial.println("bad line: " + line); return; }
+  if (c1 <= 0 || c2 <= c1) return;                 // ignore malformed line (no serial TX)
   sPct = line.substring(0, c1).toInt();
   wPct = line.substring(c1 + 1, c2).toInt();
   resetTxt = line.substring(c2 + 1); resetTxt.trim();
   haveData = true;
   lastDataMs = millis();
   offline = false;
-  Serial.printf("got s=%d w=%d reset=%s\n", sPct, wPct, resetTxt.c_str());
   drawStats();
 }
 
@@ -222,10 +222,15 @@ void setup() {
 
   // ── Then wait for real data ──
   drawWaiting();
-  Serial.println("\nClawd limits display ready. Send: session,weekly,reset");
+
+  // Watchdog: if loop() ever wedges (e.g. a stuck USB CDC), auto-reboot & recover
+  esp_task_wdt_config_t wdtCfg = { .timeout_ms = 8000, .idle_core_mask = 0, .trigger_panic = true };
+  esp_task_wdt_reconfigure(&wdtCfg);   // widen the Arduino-preinited task WDT
+  esp_task_wdt_add(NULL);              // watch this (loop) task
 }
 
 void loop() {
+  esp_task_wdt_reset();                             // feed the watchdog
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n') { parseLine(buf); buf = ""; }

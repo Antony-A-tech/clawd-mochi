@@ -197,6 +197,8 @@ def run_tray():
             if not connected:
                 with lock:
                     if ser is None: open_serial()      # keep hunting for the crab on any COM
+                if connected and last_value:           # just reconnected -> push the current value now
+                    write_crab(last_value)
             if connected != was:
                 icon.icon = crab_icon(connected); was = connected
             icon.title = (f"Clawd Mochi · {cur_port} · {last_value or '—'}") if connected else "Clawd Mochi · searching for crab…"
