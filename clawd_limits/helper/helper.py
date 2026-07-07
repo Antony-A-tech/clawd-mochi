@@ -42,7 +42,91 @@ last_update = None
 connected = False
 cur_port = None
 _fail_logged = False
+pc_locked = False                 # desktop locked (Win+L) -> crab shows eyes only
 lock = threading.Lock()
+
+# ── desktop lock detection (Win+L), no admin needed ────────────────
+# Two signals, OR'd. WTS session flag flips the INSTANT you press Win+L (while the
+# lock-screen wallpaper is still up); the input-desktop check catches the secure
+# password prompt. WTS is primary; the desktop check is a fallback if WTS returns
+# "unknown". Either one -> locked.
+try:
+    import ctypes
+    from ctypes import wintypes
+    _user32 = ctypes.windll.user32
+    _user32.OpenInputDesktop.restype = wintypes.HANDLE
+    _user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    _user32.GetUserObjectInformationW.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                  wintypes.LPVOID, wintypes.DWORD,
+                                                  ctypes.POINTER(wintypes.DWORD)]
+    _wts = ctypes.windll.wtsapi32
+
+    class _WTSINFOEX_L1(ctypes.Structure):     # WTSINFOEX_LEVEL1 (we only read SessionFlags)
+        _fields_ = [("SessionId", wintypes.ULONG), ("SessionState", ctypes.c_int),
+                    ("SessionFlags", wintypes.LONG),
+                    ("WinStationName", wintypes.WCHAR * 33), ("UserName", wintypes.WCHAR * 21),
+                    ("DomainName", wintypes.WCHAR * 18),
+                    ("LogonTime", wintypes.LARGE_INTEGER), ("ConnectTime", wintypes.LARGE_INTEGER),
+                    ("DisconnectTime", wintypes.LARGE_INTEGER), ("LastInputTime", wintypes.LARGE_INTEGER),
+                    ("CurrentTime", wintypes.LARGE_INTEGER),
+                    ("IncomingBytes", wintypes.DWORD), ("OutgoingBytes", wintypes.DWORD),
+                    ("IncomingFrames", wintypes.DWORD), ("OutgoingFrames", wintypes.DWORD),
+                    ("IncomingCompressedBytes", wintypes.DWORD), ("OutgoingCompressedBytes", wintypes.DWORD)]
+
+    class _WTSINFOEX(ctypes.Structure):
+        _fields_ = [("Level", wintypes.DWORD), ("Data", _WTSINFOEX_L1)]
+except Exception:
+    _user32 = None
+    _wts = None
+
+def _wts_locked():
+    """WTS session flag: 1 = unlocked, 0 = locked (verified non-inverted on Win10).
+    Returns None if unavailable/unknown so the caller can fall back."""
+    if _wts is None:
+        return None
+    try:
+        buf = ctypes.c_void_p(); n = wintypes.DWORD()
+        ok = _wts.WTSQuerySessionInformationW(0, 0xFFFFFFFF, 25, ctypes.byref(buf), ctypes.byref(n))  # WTS_CURRENT_SESSION, WTSSessionInfoEx
+        if not ok or not buf:
+            return None
+        try:
+            info = ctypes.cast(buf, ctypes.POINTER(_WTSINFOEX)).contents
+            if info.Level != 1:
+                return None
+            f = info.Data.SessionFlags
+            if f == 1: return False      # WTS_SESSIONSTATE_UNLOCK
+            if f == 0: return True       # WTS_SESSIONSTATE_LOCK
+            return None                  # WTS_SESSIONSTATE_UNKNOWN -> fall back
+        finally:
+            _wts.WTSFreeMemory(buf)
+    except Exception:
+        return None
+
+def _desktop_locked():
+    """True when the active input desktop is the secure one (password prompt / screen off)."""
+    if _user32 is None:
+        return False
+    try:
+        hd = _user32.OpenInputDesktop(0, False, 0x0001)      # DESKTOP_READOBJECTS
+        if not hd:
+            return True                                       # secure desktop -> locked
+        try:
+            b = ctypes.create_unicode_buffer(256); need = wintypes.DWORD()
+            _user32.GetUserObjectInformationW(hd, 2, b, ctypes.sizeof(b), ctypes.byref(need))  # UOI_NAME
+            return b.value != "Default"
+        finally:
+            _user32.CloseDesktop(hd)
+    except Exception:
+        return False
+
+def is_locked():
+    """Locked if the WTS session flag says so (fires at Win+L), or, when that is
+    unknown, if the active desktop is the secure one."""
+    w = _wts_locked()
+    if w is not None:
+        return w
+    return _desktop_locked()
 
 # ── find the crab on any COM port by its USB id ────────────────────
 def find_crab_ports():
@@ -102,6 +186,24 @@ def write_crab(line):
             ser = None; connected = False
             return False
 
+def push_state():
+    """Send the crab what it should show right now: eyes if locked, else the last value."""
+    if pc_locked:
+        write_crab("LOCK")
+    elif last_value:
+        write_crab(last_value)
+
+def lock_watcher():
+    """Poll the desktop lock state; on change, flip the crab between eyes and stats."""
+    global pc_locked
+    while True:
+        now = is_locked()
+        if now != pc_locked:
+            pc_locked = now
+            push_state()
+            print(f"[lock] desktop {'LOCKED -> eyes' if now else 'unlocked -> stats'}", flush=True)
+        time.sleep(1)
+
 def reconnect():
     global ser
     with lock:
@@ -110,14 +212,12 @@ def reconnect():
         except Exception: pass
         ser = None
     open_serial()
-    if last_value:
-        write_crab(last_value)
+    push_state()
 
 def resender():
     while True:
         time.sleep(RESEND_SECS)
-        if last_value:
-            write_crab(last_value)
+        push_state()                 # LOCK keep-alive if locked, else re-send the value
 
 # ── http ──────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
@@ -134,8 +234,12 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(n).decode("utf-8", "ignore").strip()
         last_value = body; last_update = time.time()
-        ok = write_crab(body)
-        print(f"[recv] {body!r} -> serial {'OK' if ok else 'FAIL'}", flush=True)
+        if pc_locked:                                  # keep the eyes; stash the value for unlock
+            ok = True
+            print(f"[recv] {body!r} -> held (locked)", flush=True)
+        else:
+            ok = write_crab(body)
+            print(f"[recv] {body!r} -> serial {'OK' if ok else 'FAIL'}", flush=True)
         self.send_response(200 if ok else 500)
         self._cors(); self.send_header("Content-Type", "text/plain"); self.end_headers()
         self.wfile.write(b"ok" if ok else b"serial-fail")
@@ -179,10 +283,11 @@ def _ago():
 def run_tray():
     open_serial()
     threading.Thread(target=resender, daemon=True).start()
+    threading.Thread(target=lock_watcher, daemon=True).start()
     srv = start_http()
 
     menu = pystray.Menu(
-        pystray.MenuItem(lambda i: ("● " + cur_port if connected else "○ searching for crab…"), None, enabled=False),
+        pystray.MenuItem(lambda i: (("● " + cur_port + (" · locked" if pc_locked else "")) if connected else "○ searching for crab…"), None, enabled=False),
         pystray.MenuItem(lambda i: f"Last: {last_value or '—'}", None, enabled=False),
         pystray.MenuItem(lambda i: f"Updated: {_ago()}", None, enabled=False),
         pystray.Menu.SEPARATOR,
@@ -197,11 +302,12 @@ def run_tray():
             if not connected:
                 with lock:
                     if ser is None: open_serial()      # keep hunting for the crab on any COM
-                if connected and last_value:           # just reconnected -> push the current value now
-                    write_crab(last_value)
+                if connected:                          # just reconnected -> restore state (eyes or value)
+                    push_state()
             if connected != was:
                 icon.icon = crab_icon(connected); was = connected
-            icon.title = (f"Clawd Mochi · {cur_port} · {last_value or '—'}") if connected else "Clawd Mochi · searching for crab…"
+            _st = (" · locked" if pc_locked else "")
+            icon.title = (f"Clawd Mochi · {cur_port} · {last_value or '—'}{_st}") if connected else "Clawd Mochi · searching for crab…"
             try: icon.update_menu()
             except Exception: pass
             time.sleep(3)
@@ -215,6 +321,7 @@ def run_tray():
 def run_console():
     open_serial()
     threading.Thread(target=resender, daemon=True).start()
+    threading.Thread(target=lock_watcher, daemon=True).start()
     srv = HTTPServer(("127.0.0.1", HTTP_PORT), Handler)
     print(f"[http] http://127.0.0.1:{HTTP_PORT}  crab={cur_port or 'auto'}  re-send={RESEND_SECS}s  (console)", flush=True)
     try:

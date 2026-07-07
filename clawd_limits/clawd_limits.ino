@@ -13,7 +13,8 @@
 #include <Fonts/FreeMonoBold12pt7b.h>
 #include <Fonts/FreeMonoBold24pt7b.h>
 #include "logo_boot.h"
-#include "esp_task_wdt.h"
+#include "esp_timer.h"
+#include "esp_system.h"
 
 #define TFT_CS  4
 #define TFT_DC  1
@@ -23,6 +24,8 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 #define DISP_W 240
 #define DISP_H 240
+
+#define FW_VERSION "1.1.0"            // limits firmware: lock-mode eyes + hang-watchdog
 
 uint16_t C_ORANGE, C_BLACK_, C_TRACK, C_BOOT;
 uint16_t C_GRAY_BG, C_GRAY_FG, C_GRAY_FILL;
@@ -41,6 +44,11 @@ uint8_t  offlinePhase   = 0;          // 0 = offline screen, 1 = normal eyes, 2 
 unsigned long offlinePhaseMs = 0;
 const unsigned long PHASE_MS = 10000; // 10 s per phase
 
+// Desktop-locked mode: eyes only (normal <-> squish), driven by the PC helper
+bool     locked = false;
+uint8_t  lockEye = 0;                 // 0 = normal eyes, 1 = squish
+unsigned long lockPhaseMs = 0;
+
 // v1.0.0 eye geometry (ported verbatim)
 #define EYE_W   30
 #define EYE_H   60
@@ -48,10 +56,33 @@ const unsigned long PHASE_MS = 10000; // 10 s per phase
 #define EYE_OX  0
 #define EYE_OY  40
 
+// ── hang-watchdog + crash forensics ──────────────────────────────
+// Breadcrumb of WHERE loop() was; RTC memory survives a WD/SW reset (not power-off).
+RTC_NOINIT_ATTR uint32_t g_phase;     // last phase loop() ran (see PH_*)
+RTC_NOINIT_ATTR uint32_t g_magic;     // PH_MAGIC once booted -> RTC vars are valid
+RTC_NOINIT_ATTR uint32_t g_resets;    // reboots since the last real power-on
+#define PH_MAGIC  0xC1A0D0EE
+#define PH_IDLE   1                   // between polls
+#define PH_SERIAL 2                   // reading/parsing USB-CDC
+#define PH_BLIT   5                   // pushing a frame over SPI to the panel
+#define PH_ANIM   6                   // offline eye animation
+volatile uint32_t g_beat = 0;         // loop heartbeat; watched by the esp_timer WD
+String bootInfo = "";                 // "<reason> ph:<n> #<resets>" after a reset, else ""
+
 // Offscreen buffer — draw the whole frame here, push it in one SPI blit.
 // Kills the redraw flicker (no fillScreen flash on the live display).
 GFXcanvas16 *cv = nullptr;
-void blit() { tft.drawRGBBitmap(0, 0, cv->getBuffer(), DISP_W, DISP_H); }
+void blit() { g_phase = PH_BLIT; tft.drawRGBBitmap(0, 0, cv->getBuffer(), DISP_W, DISP_H); }
+
+// Independent hang-watchdog: this runs in the esp_timer task, so it still fires
+// even when loop() is wedged (a stuck USB-CDC or SPI call). No heartbeat for
+// ~10 s -> reboot. Unlike the panic-based task WDT, esp_restart() can't get
+// stuck printing a backtrace to a dead console.
+void wdCheck(void*) {
+  static uint32_t last = 0; static uint8_t stalls = 0;
+  if (g_beat == last) { if (++stalls >= 5) esp_restart(); }   // 5 x 2 s
+  else { stalls = 0; last = g_beat; }
+}
 
 uint16_t levelColor(int p) {
   if (p < 50) return tft.color565(60, 200, 100);   // green
@@ -70,12 +101,26 @@ void label(int x, int y, const String& s) {
   cv->print(s);
 }
 
+// tiny diagnostic line (built-in 5x7) — shows the last reset cause+phase after a reboot
+void diag() {
+  if (!bootInfo.length()) return;
+  cv->setFont(NULL);
+  cv->setTextSize(1);
+  cv->setTextColor(FG);
+  cv->setCursor(2, 2);
+  cv->print(bootInfo);
+}
+
 void drawWaiting() {
   FG = C_BLACK_;
   cv->fillScreen(C_ORANGE);
   label(14,36, "claude limits");
   label(14,120, "waiting for");
   label(14,152, "PC data...");
+  diag();
+  // firmware version, tiny, bottom-left
+  cv->setFont(NULL); cv->setTextSize(1); cv->setTextColor(C_BLACK_);
+  cv->setCursor(2, DISP_H - 10); cv->print("v" FW_VERSION);
   blit();
 }
 
@@ -106,6 +151,7 @@ void drawStats() {
   char w[20]; snprintf(w, sizeof(w), "week %d%%", wPct);
   label(14,190, w);
   label(14,222, offline ? String("offline") : ("reset " + resetTxt));
+  diag();
   blit();
 }
 
@@ -178,6 +224,10 @@ void animSquishEyes() {
 void parseLine(String line) {
   line.trim();
   if (line.length() == 0) return;
+  if (line == "LOCK") {                            // PC desktop locked -> eyes-only mode
+    if (!locked) { locked = true; lockEye = 0; lockPhaseMs = millis(); }
+    return;
+  }
   int c1 = line.indexOf(',');
   int c2 = line.indexOf(',', c1 + 1);
   if (c1 <= 0 || c2 <= c1) return;                 // ignore malformed line (no serial TX)
@@ -187,10 +237,32 @@ void parseLine(String line) {
   haveData = true;
   lastDataMs = millis();
   offline = false;
+  locked = false;                       // any data line unlocks (PC is back)
   drawStats();
 }
 
 void setup() {
+  // ── forensics: why did we last reset, and where was loop() stuck? ──
+  esp_reset_reason_t rr = esp_reset_reason();
+  if (g_magic == PH_MAGIC && rr != ESP_RST_POWERON) {
+    const char* r;
+    switch (rr) {
+      case ESP_RST_TASK_WDT: r = "TWDT";  break;   // task watchdog
+      case ESP_RST_INT_WDT:  r = "IWDT";  break;   // interrupt watchdog
+      case ESP_RST_WDT:      r = "WDT";   break;   // other watchdog
+      case ESP_RST_PANIC:    r = "PANIC"; break;   // crash / exception
+      case ESP_RST_BROWNOUT: r = "BROWN"; break;   // voltage sag (power/hw!)
+      case ESP_RST_SW:       r = "SW";    break;   // our esp_restart() (hang WD)
+      default:               r = "rst?";  break;
+    }
+    g_resets++;
+    bootInfo = String(r) + " ph:" + String(g_phase) + " #" + String(g_resets);
+  } else {
+    g_resets = 0;                                  // fresh power-on
+  }
+  g_magic = PH_MAGIC;
+  g_phase = PH_IDLE;
+
   Serial.begin(115200);
   pinMode(TFT_BLK, OUTPUT); digitalWrite(TFT_BLK, HIGH);
   SPI.begin(8, -1, 10, TFT_CS);
@@ -223,18 +295,30 @@ void setup() {
   // ── Then wait for real data ──
   drawWaiting();
 
-  // Watchdog: if loop() ever wedges (e.g. a stuck USB CDC), auto-reboot & recover
-  esp_task_wdt_config_t wdtCfg = { .timeout_ms = 8000, .idle_core_mask = 0, .trigger_panic = true };
-  esp_task_wdt_reconfigure(&wdtCfg);   // widen the Arduino-preinited task WDT
-  esp_task_wdt_add(NULL);              // watch this (loop) task
+  // Start the independent hang-watchdog (fires from the esp_timer task even if loop() wedges)
+  static esp_timer_handle_t wdTimer;
+  esp_timer_create_args_t wdArgs = { .callback = &wdCheck, .arg = nullptr,
+                                     .dispatch_method = ESP_TIMER_TASK, .name = "hangwd" };
+  esp_timer_create(&wdArgs, &wdTimer);
+  esp_timer_start_periodic(wdTimer, 2000000);   // check every 2 s; reboot after ~10 s stall
 }
 
 void loop() {
-  esp_task_wdt_reset();                             // feed the watchdog
+  g_beat++;                                         // heartbeat for the hang-watchdog
+  g_phase = PH_SERIAL;
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n') { parseLine(buf); buf = ""; }
     else if (c != '\r' && buf.length() < 120) { buf += c; }
+  }
+  g_phase = PH_IDLE;
+  // Desktop locked -> eyes only (normal <-> squish), no offline text, until data returns
+  if (locked) {
+    if (millis() - lockPhaseMs >= PHASE_MS) { lockEye ^= 1; lockPhaseMs = millis(); }
+    g_phase = PH_ANIM;
+    if (lockEye == 0) animNormalEyes(); else animSquishEyes();
+    delay(600);
+    return;
   }
   // No fresh data for STALE_MS -> enter the offline "alive" cycle
   if (haveData && !offline && (millis() - lastDataMs > STALE_MS)) {
@@ -250,7 +334,7 @@ void loop() {
       offlinePhaseMs = millis();
       if (offlinePhase == 0) drawStats();
     }
-    if (offlinePhase == 1)      { animNormalEyes(); delay(600); }
-    else if (offlinePhase == 2) { animSquishEyes(); delay(600); }
+    if (offlinePhase == 1)      { g_phase = PH_ANIM; animNormalEyes(); delay(600); }
+    else if (offlinePhase == 2) { g_phase = PH_ANIM; animSquishEyes(); delay(600); }
   }
 }
