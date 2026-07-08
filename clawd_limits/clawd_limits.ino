@@ -237,7 +237,13 @@ void displayInit() {
 void parseLine(String line) {
   line.trim();
   if (line.length() == 0) return;
-  if (line == "REINIT") { displayInit(); if (haveData) drawStats(); else drawWaiting(); return; }  // recover a frozen panel without a reboot
+  if (line == "REINIT") {                            // recover a frozen panel without a reboot
+    displayInit();
+    delay(150);                                      // let the panel settle before the first write (boot has a long delay here too)
+    if (haveData) drawStats(); else drawWaiting();
+    if (haveData) drawStats(); else drawWaiting();   // draw twice: the first frame right after re-init can land partial (garbage band)
+    return;
+  }
   if (line == "LOCK") {                            // PC desktop locked -> eyes-only mode
     if (!locked) { locked = true; lockEye = 0; lockPhaseMs = millis(); }
     return;
