@@ -29,12 +29,14 @@ except Exception:
 
 _args = sys.argv[1:]
 CONSOLE = "--console" in _args
+AUTO_REINIT = "--auto-reinit" in _args   # hourly panel re-init — only for the flaky 1.3" panel
 _pos = [a for a in _args if not a.startswith("--")]
 
 HTTP_PORT   = 7654
 COM         = _pos[0] if _pos else None   # explicit port, or None -> auto-detect
 BAUD        = 115200
 RESEND_SECS = 30
+REINIT_SECS = 3600        # hourly panel re-init: auto-recovers the flaky 1.3" panel's freezes
 
 ser = None
 last_value = None
@@ -212,12 +214,24 @@ def reconnect():
         except Exception: pass
         ser = None
     open_serial()
+    if connected:
+        write_crab("REINIT")         # recover a frozen ST7789 panel without a reboot
     push_state()
 
 def resender():
     while True:
         time.sleep(RESEND_SECS)
         push_state()                 # LOCK keep-alive if locked, else re-send the value
+
+def reiniter():
+    # The 1.3" panel occasionally freezes (hardware fault); a periodic REINIT re-inits
+    # it and redraws, so it self-heals without anyone clicking. Skipped while locked
+    # (would briefly flash stats over the eyes). ~2 freezes/day -> hourly bounds the stall.
+    while True:
+        time.sleep(REINIT_SECS)
+        if connected and not pc_locked:
+            write_crab("REINIT")
+            print("[reinit] periodic panel re-init", flush=True)
 
 # ── http ──────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
@@ -284,6 +298,7 @@ def run_tray():
     open_serial()
     threading.Thread(target=resender, daemon=True).start()
     threading.Thread(target=lock_watcher, daemon=True).start()
+    if AUTO_REINIT: threading.Thread(target=reiniter, daemon=True).start()
     srv = start_http()
 
     menu = pystray.Menu(
@@ -291,7 +306,7 @@ def run_tray():
         pystray.MenuItem(lambda i: f"Last: {last_value or '—'}", None, enabled=False),
         pystray.MenuItem(lambda i: f"Updated: {_ago()}", None, enabled=False),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Reconnect serial", lambda i, item: reconnect()),
+        pystray.MenuItem("Reconnect / fix display", lambda i, item: reconnect()),
         pystray.MenuItem("Quit", lambda i, item: i.stop()),
     )
     icon = pystray.Icon("clawd_helper", crab_icon(connected), "Clawd Mochi helper", menu=menu)
@@ -322,6 +337,7 @@ def run_console():
     open_serial()
     threading.Thread(target=resender, daemon=True).start()
     threading.Thread(target=lock_watcher, daemon=True).start()
+    if AUTO_REINIT: threading.Thread(target=reiniter, daemon=True).start()
     srv = HTTPServer(("127.0.0.1", HTTP_PORT), Handler)
     print(f"[http] http://127.0.0.1:{HTTP_PORT}  crab={cur_port or 'auto'}  re-send={RESEND_SECS}s  (console)", flush=True)
     try:

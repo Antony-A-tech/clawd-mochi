@@ -15,6 +15,9 @@
 #include "logo_boot.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_task_wdt.h"
+#include "esp_rom_sys.h"
+#include <Preferences.h>
 
 #define TFT_CS  4
 #define TFT_DC  1
@@ -25,7 +28,7 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 #define DISP_W 240
 #define DISP_H 240
 
-#define FW_VERSION "1.1.0"            // limits firmware: lock-mode eyes + hang-watchdog
+#define FW_VERSION "1.1.0-panelfix"   // v1.1.0 + SPI 20MHz + REINIT recovery for the flaky 1.3" panel
 
 uint16_t C_ORANGE, C_BLACK_, C_TRACK, C_BOOT;
 uint16_t C_GRAY_BG, C_GRAY_FG, C_GRAY_FILL;
@@ -68,6 +71,7 @@ RTC_NOINIT_ATTR uint32_t g_resets;    // reboots since the last real power-on
 #define PH_ANIM   6                   // offline eye animation
 volatile uint32_t g_beat = 0;         // loop heartbeat; watched by the esp_timer WD
 String bootInfo = "";                 // "<reason> ph:<n> #<resets>" after a reset, else ""
+Preferences prefs;                    // NVS: remember the last hang across a power-cycle
 
 // Offscreen buffer — draw the whole frame here, push it in one SPI blit.
 // Kills the redraw flicker (no fillScreen flash on the live display).
@@ -80,7 +84,7 @@ void blit() { g_phase = PH_BLIT; tft.drawRGBBitmap(0, 0, cv->getBuffer(), DISP_W
 // stuck printing a backtrace to a dead console.
 void wdCheck(void*) {
   static uint32_t last = 0; static uint8_t stalls = 0;
-  if (g_beat == last) { if (++stalls >= 5) esp_restart(); }   // 5 x 2 s
+  if (g_beat == last) { if (++stalls >= 5) esp_rom_software_reset_system(); }  // hard ROM reset: no peripheral cleanup, can't wedge like esp_restart()
   else { stalls = 0; last = g_beat; }
 }
 
@@ -221,9 +225,19 @@ void animSquishEyes() {
   drawSquishEyes(false);
 }
 
+// Panel bring-up (SPI mode 3 + lowered clock for signal integrity on the flaky panel).
+// Factored out so a REINIT command can recover a frozen display without a reboot.
+void displayInit() {
+  tft.init(240, 240, SPI_MODE3);
+  tft.setSPISpeed(20000000);        // 20 MHz (was 40) — the flaky 1.3" panel freezes under heavy SPI at 40
+  tft.setRotation(1);
+  tft.setTextWrap(false);
+}
+
 void parseLine(String line) {
   line.trim();
   if (line.length() == 0) return;
+  if (line == "REINIT") { displayInit(); if (haveData) drawStats(); else drawWaiting(); return; }  // recover a frozen panel without a reboot
   if (line == "LOCK") {                            // PC desktop locked -> eyes-only mode
     if (!locked) { locked = true; lockEye = 0; lockPhaseMs = millis(); }
     return;
@@ -253,12 +267,19 @@ void setup() {
       case ESP_RST_PANIC:    r = "PANIC"; break;   // crash / exception
       case ESP_RST_BROWNOUT: r = "BROWN"; break;   // voltage sag (power/hw!)
       case ESP_RST_SW:       r = "SW";    break;   // our esp_restart() (hang WD)
-      default:               r = "rst?";  break;
+      default: { static char nb[10]; snprintf(nb, sizeof(nb), "rst%d", (int)rr); r = nb; break; }  // numeric code -> decode later
     }
     g_resets++;
     bootInfo = String(r) + " ph:" + String(g_phase) + " #" + String(g_resets);
+    prefs.begin("clawd", false);
+    prefs.putString("lasthang", bootInfo);         // durable: survives a later power-cycle
+    prefs.end();
   } else {
-    g_resets = 0;                                  // fresh power-on
+    g_resets = 0;                                  // fresh power-on -> RTC wiped
+    prefs.begin("clawd", true);
+    String last = prefs.getString("lasthang", ""); // still show the last recorded hang
+    prefs.end();
+    if (last.length()) bootInfo = "PWR last:" + last;
   }
   g_magic = PH_MAGIC;
   g_phase = PH_IDLE;
@@ -266,10 +287,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(TFT_BLK, OUTPUT); digitalWrite(TFT_BLK, HIGH);
   SPI.begin(8, -1, 10, TFT_CS);
-  tft.init(240, 240, SPI_MODE3);
-  tft.setSPISpeed(40000000);
-  tft.setRotation(1);
-  tft.setTextWrap(false);
+  displayInit();
   C_ORANGE = tft.color565(217, 119, 87);   // Claude clay (limits screen)
   C_BLACK_ = tft.color565(20, 16, 14);      // near-black
   C_TRACK  = tft.color565(34, 24, 18);      // dark bar track
@@ -295,7 +313,13 @@ void setup() {
   // ── Then wait for real data ──
   drawWaiting();
 
-  // Start the independent hang-watchdog (fires from the esp_timer task even if loop() wedges)
+  // Watchdog 1 (hardware-backed): Task WDT on the loop task. Fires via the panic+RTC
+  // reset path, which can't wedge on a stuck console the way esp_restart() might.
+  esp_task_wdt_config_t twdt = { .timeout_ms = 8000, .idle_core_mask = 0, .trigger_panic = true };
+  if (esp_task_wdt_init(&twdt) == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&twdt);
+  esp_task_wdt_add(NULL);                        // watch this (loop) task
+
+  // Watchdog 2 (backup): independent esp_timer heartbeat -> HARD ROM reset if loop() stalls.
   static esp_timer_handle_t wdTimer;
   esp_timer_create_args_t wdArgs = { .callback = &wdCheck, .arg = nullptr,
                                      .dispatch_method = ESP_TIMER_TASK, .name = "hangwd" };
@@ -304,7 +328,8 @@ void setup() {
 }
 
 void loop() {
-  g_beat++;                                         // heartbeat for the hang-watchdog
+  g_beat++;                                         // heartbeat for the esp_timer WD
+  esp_task_wdt_reset();                             // feed the Task WDT
   g_phase = PH_SERIAL;
   while (Serial.available()) {
     char c = (char)Serial.read();
